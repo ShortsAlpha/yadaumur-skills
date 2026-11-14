@@ -38,7 +38,7 @@ It is idempotent: a second run changes nothing. Links that point somewhere else 
 
 ### agent-budget
 
-Decides, before and during multi-step work, how much quota a job may use and which model and effort each subagent gets (Haiku / Sonnet / Opus, low to xhigh), from the live Claude and Codex limits and the burn rate. Classifies the budget as Green / Yellow / Red by "pace gap" (used % minus elapsed % of each window), estimates the job size, picks model and effort per subagent from a table, and reports the plan in one line or asks when the budget is tight. It also holds the orchestrator rules (the main agent delegates code work to the lean agents and reads their reports) and how to write briefs for each model.
+Decides, before and during multi-step work, how much quota a job may use and which model and effort each subagent gets (Haiku / Sonnet / Opus, low to xhigh), from the live Claude and Codex limits and the burn rate. Classifies the budget as Green / Yellow / Red by "pace gap" (used % minus elapsed % of each window), estimates the job size, picks model and effort per subagent from a table, and reports the plan in one line or asks when the budget is tight. A tight budget brings a warning or a question, never an automatic switch to cheaper models: those are used only when the user asks to save quota. It also holds the orchestrator rules (the main agent delegates code work to the lean agents and reads their reports) and how to write briefs for each model.
 
 - **Triggers:** the start of any task that will spawn subagents, run a workflow or a big Codex/image batch, or take more than a few minutes; again before each new wave of subagents.
 - **Depends on:** `usage-limits`; `devir` for the handoff threshold; optionally `codex` for offloading.
