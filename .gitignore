@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local runtime data written next to the skills
+calibration-*.log
+*.bak
+*.tmp
+.beyin-note-write/
+
+# OS
+.DS_Store
+Thumbs.db
