@@ -9,7 +9,7 @@ The user runs very long sessions and may rotate between several Claude accounts 
 
 ## When to write a handoff (proactively, don't wait to be asked)
 
-- **Limit about to end:** `agent-budget` sees the Claude 5-hour window ≥ 85 % (or weekly ≥ 95 %) during a job that won't finish in the remaining budget. Write the handoff **now**, while you still can: at 100 % the session can't even write it.
+- **Limit about to end:** `agent-budget` sees the Claude 5-hour window ≥ 95 % (or weekly ≥ 95 %) during a job that won't finish in the remaining budget (user's choice, 2026-11-15; `agent-budget` re-checks limits often from 85 % on so the 95 % mark isn't missed). Write the handoff **now**, before anything else and kept short: at 100 % the session can't even write it.
 - The user says they're switching account/device or stopping for the day mid-work.
 - The context window is ≥ 85 % full (check with `mcp__ccd_session_mgmt__get_usage` → `context`) and the job continues.
 - Not for finished work: when a job is done, `vault-live` records it and no handoff is needed (close any open one, see below).
