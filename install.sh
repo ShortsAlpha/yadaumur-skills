@@ -7,7 +7,8 @@
 #   3. adds the vault-live hooks (Stop, SessionStart) to ~/.claude/settings.json (idempotent), only when
 #      a notes vault with beyin.py exists ($VAULT_LIVE_VAULT, $SECOND_BRAIN_DIR, ~/second_brain, C:\second_brain)
 #   4. adds the agent-budget guard (PreToolUse on Agent|Task|Workflow) to ~/.claude/settings.json (idempotent)
-#   5. optional: Codex CLI on PATH (npm i -g @openai/codex) and OpenAI's official Claude Code plugin
+#   5. macOS only: adds the disk-cleanup reminder hook (SessionStart, UserPromptSubmit) to ~/.claude/settings.json
+#   6. optional: Codex CLI on PATH (npm i -g @openai/codex) and OpenAI's official Claude Code plugin
 #      (codex@openai-codex); skipped with a message when npm / the claude CLI is missing, or with --no-codex
 # Safe to run again: a second run changes nothing.
 # Usage: bash install.sh [--no-codex]
@@ -17,7 +18,7 @@ NO_CODEX=0
 for arg in "$@"; do
   case "$arg" in
     --no-codex) NO_CODEX=1 ;;
-    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "install.sh: unknown option $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -120,7 +121,14 @@ fi
 echo "4) agent-budget guard hook"
 run_step "agent-guard install-hook" bash "$HERE/skills/agent-budget/scripts/agent-guard.sh" install-hook
 
-echo "5) Codex CLI and the official Codex plugin (optional)"
+echo "5) disk-cleanup hook (macOS only)"
+if [ "$(uname -s)" = "Darwin" ]; then
+  run_step "disk-cleanup install-hook" bash "$HERE/skills/disk-cleanup/scripts/disk-cleanup.sh" install-hook
+else
+  skip "macOS only; disk-cleanup hook not installed on this system"
+fi
+
+echo "6) Codex CLI and the official Codex plugin (optional)"
 if [ "$NO_CODEX" = 1 ]; then
   skip "skipped (--no-codex)"
 else
