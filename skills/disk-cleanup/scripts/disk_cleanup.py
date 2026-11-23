@@ -767,13 +767,20 @@ class Activity:
 
 # A line break inside a command line, raw or as ps prints it (\012, \015).
 ARG_LINE_BREAK = re.compile(r"[\r\n]|\\01[25]")
-# A plain path word: path characters only, at least one slash (no quotes, brackets, "=", prose punctuation).
-PLAIN_PATH = re.compile(r"[\w.+@~,%-]*/[\w.+@~,%/-]*")
+# The path a word ends with: path characters only, at least one slash. ps joins arguments with spaces, so a
+# path with a space or a bracket in a folder name ("App (copy)/node_modules/.bin/playwright") keeps its tail;
+# a word ending in a quote or bracket (JSON, profile text: ...Simulator"}) has no tail and names nothing.
+PATH_TAIL = re.compile(r"[\w.+@~,%-]*(?:/[\w.+@~,%-]*)+$")
 # A bare dotted name: a script file or a class / bundle id (brew.sh, pnpm.cjs, org.gradle...GradleDaemon).
 DOTTED_NAME = re.compile(r"[A-Za-z_$][\w$-]*(?:\.[A-Za-z_$][\w$-]*)+")
-# Programs whose first operand is the program they run (a script, `-m module`, `-c command`).
+# Programs whose first operand is the program they run (a script, `-m module`, `-c command`). Any case:
+# macOS Pythons re-launch as .../Python.app/Contents/MacOS/Python.
 INTERPRETER = re.compile(r"(?:sh|bash|zsh|dash|ksh|fish|node|nodejs|bun|deno|"
-                         r"python[\d.]*|pypy[\d.]*|ruby[\d.]*|perl[\d.]*)")
+                         r"python[\d.]*|pypy[\d.]*|ruby[\d.]*|perl[\d.]*)", re.IGNORECASE)
+# An option (or short-option cluster) whose value is the program: python -m pip, bash -c / -lc "npm ...".
+PROGRAM_OPTION = re.compile(r"-[A-Za-z]*[mc]")
+# Scripts that run the next word's tool inside their own process: corepack pnpm install.
+LAUNCHERS = ("corepack",)
 
 
 def path_names(word, names):
@@ -790,34 +797,49 @@ def path_names(word, names):
             names.add(part.rsplit(".", 1)[-1])
 
 
+def program_name(word):
+    """A word naming a program, without a version suffix (pnpm@9 -> pnpm)."""
+    return word.split("@", 1)[0] if not word.startswith("@") else word
+
+
 def names_from_args(lines):
     """Tool names of running programs, one process command line per entry. A process names:
     its executable (first word: every path part, Xcode.app/Contents/MacOS/Xcode -> Xcode); later words
-    that are plain paths (node .../pnpm.cjs -> pnpm, bash .../brew.sh -> brew, a classpath under
-    .gradle -> gradle; colon lists are split) or bare dotted names (org.gradle...GradleDaemon ->
-    GradleDaemon); and the first operand of a shell or interpreter (`python -m pip` -> pip,
-    `bash -c npm ...` -> npm). Plain words, quoted text, KEY=value and everything after the first line
-    break (the body of an inline script or profile) name nothing: wrappers (disclaimer --, sandbox-exec,
-    env, xcrun) start the real program as its own process, which is listed on its own."""
+    that end in a path (node .../pnpm.cjs -> pnpm, bash .../brew.sh -> brew, a classpath under
+    .gradle -> gradle; colon lists are split) or are bare dotted names (org.gradle...GradleDaemon ->
+    GradleDaemon); for a shell or interpreter, its first operand and the word after -m / -c
+    (`python -X utf8 -m pip` -> pip, `bash -lc npm ...` -> npm); and the word after a launcher script
+    (`node .../corepack pnpm install` -> pnpm). Plain words, quoted text, KEY=value and everything after
+    the first line break (the body of an inline script or profile) name nothing: wrappers (disclaimer --,
+    sandbox-exec, env, xcrun) start the real program as its own process, which is listed on its own."""
     names = set()
     for line in lines:
         words = ARG_LINE_BREAK.split(line, 1)[0].split()
         if not words:
             continue
         path_names(words[0], names)
-        program = os.path.basename(words[0])
-        operand_due = bool(INTERPRETER.fullmatch(program))
+        interpreter = bool(INTERPRETER.fullmatch(os.path.basename(words[0])))
+        operand_due = interpreter or os.path.splitext(os.path.basename(words[0]))[0] in LAUNCHERS
+        option_value_due = False
         for word in words[1:]:
-            if operand_due and not word.startswith("-"):
-                operand_due = False
+            if word.startswith("-"):
+                option_value_due = interpreter and bool(PROGRAM_OPTION.fullmatch(word))
+                continue
+            if operand_due or option_value_due:
+                operand_due = option_value_due = False
                 if "/" not in word:
-                    path_names(word, names)
-                    continue
-            if word.startswith("-") or "=" in word:
+                    path_names(program_name(word), names)
+            if "=" in word:
                 continue
             for piece in word.split(":"):
-                if PLAIN_PATH.fullmatch(piece) or DOTTED_NAME.fullmatch(piece):
-                    path_names(piece, names)
+                tail = PATH_TAIL.search(piece) if "/" in piece else None
+                if tail:
+                    piece = tail.group(0)
+                elif not DOTTED_NAME.fullmatch(piece):
+                    continue
+                path_names(piece, names)
+                if os.path.splitext(piece.rsplit("/", 1)[-1])[0] in LAUNCHERS:
+                    operand_due = True
     return names
 
 
@@ -848,8 +870,11 @@ def running_names():
     code, out, _ = run_cmd([ps, "-axo", "pid=,args="], QUERY_TIMEOUT)
     if code != 0:
         return None
+    procs = split_ps(out)
+    if not procs:  # no usable line: unknown, not "nothing running"
+        return None
     mine = {str(os.getpid()), str(os.getppid())}
-    return names_from_args([args for pid, args in split_ps(out) if pid not in mine])
+    return names_from_args([args for pid, args in procs if pid not in mine])
 
 
 def booted_simulators():

@@ -861,7 +861,10 @@ class SafetyDetailTest(Base):
         for line in ('/usr/bin/log stream --predicate process contains "Xcode" and subsystem == "x"',
                      "/usr/bin/say Xcode is done", "/usr/bin/env XCODE=/Applications/Xcode.app/Contents/MacOS/Xcode",
                      "/usr/bin/git commit -m Xcode xcodebuild Simulator fixes",
-                     "/bin/zsh -c source /tmp/snap.sh\\012export X=1\\012xcodebuild -scheme App"):
+                     "/bin/zsh -c source /tmp/snap.sh\\012export X=1\\012xcodebuild -scheme App",
+                     '/usr/bin/tool --json {"path":"/Applications/Xcode.app/Contents/Developer'
+                     '/Applications/Simulator"}',
+                     "/usr/bin/tool [/Applications/Xcode.app/Contents/MacOS/Xcode] '/x/xcodebuild'"):
             self.assertFalse(set(self.XCODE) & dc.names_from_args([line]), line)
 
     def test_process_names_still_find_running_tools(self):
@@ -877,7 +880,7 @@ class SafetyDetailTest(Base):
         self.assertIn("npm", dc.names_from_args(["/bin/bash -c npm run dev"]))
         self.assertIn("npm", dc.names_from_args(["node /opt/homebrew/lib/node_modules/npm/bin/npm-cli.js ci"]))
         self.assertIn("playwright", dc.names_from_args(["node /x/node_modules/playwright/cli.js test"]))
-        self.assertIn("pip", dc.names_from_args(["python3.12 -m pip install -r req.txt"]))
+        self.assertIn("pip", dc.names_from_args(["/usr/bin/python3 -m pip install -r req.txt"]))
         self.assertIn("pod", dc.names_from_args(["/usr/bin/ruby /opt/homebrew/bin/pod install"]))
         self.assertIn("brew", dc.names_from_args(["/bin/bash brew.sh update"]))
         self.assertIn("gradlew", dc.names_from_args(["/bin/sh ./gradlew assembleDebug"]))
@@ -885,6 +888,48 @@ class SafetyDetailTest(Base):
                                                     "org.gradle.wrapper.GradleWrapperMain build"]))
         self.assertIn("xcodebuild", dc.names_from_args(
             ["/Applications/Some.app/Contents/Helpers/disclaimer -- " + dev + "/usr/bin/xcodebuild test"]))
+
+    def test_framework_python_is_an_interpreter(self):
+        framework = ("/opt/homebrew/Cellar/python@3.13/3.13.1/Frameworks/Python.framework/Versions/3.13/"
+                     "Resources/Python.app/Contents/MacOS/Python")
+        self.assertIn("pip", dc.names_from_args([framework + " -m pip install requests"]))
+        self.assertIn("pip", dc.names_from_args(["python3 -m pip install requests"]))
+
+    def test_corepack_runs_the_next_tool(self):
+        self.assertIn("pnpm", dc.names_from_args(["node /usr/local/bin/corepack pnpm install"]))
+        self.assertIn("yarn", dc.names_from_args(["node /usr/local/bin/corepack yarn install"]))
+        self.assertIn("pnpm", dc.names_from_args(["node /x/corepack/dist/corepack.js pnpm@9.1.0 install"]))
+        self.assertNotIn("install", dc.names_from_args(["node /x/node_modules/.bin/eslint install"]))
+
+    def test_path_with_brackets_or_spaces_keeps_its_tail(self):
+        for line, name in (("node /Users/u/App (copy)/node_modules/.bin/playwright test", "playwright"),
+                           ("/bin/sh /Users/u/App (copy)/android/gradlew assembleDebug", "gradlew"),
+                           ("/Volumes/Dev (SSD)/Xcode.app/Contents/Developer/usr/bin/xcodebuild -scheme A",
+                            "xcodebuild"),
+                           ("node /Users/u/proj#2/node_modules/.bin/playwright test", "playwright"),
+                           ("node /Users/u/R&D [old]!/node_modules/.bin/playwright test", "playwright")):
+            self.assertIn(name, dc.names_from_args([line]), line)
+
+    def test_program_option_after_other_options(self):
+        self.assertIn("pip", dc.names_from_args(["python3 -X utf8 -m pip install x"]))
+        self.assertIn("pip", dc.names_from_args(["python3 -I -W ignore -m pip install x"]))
+        self.assertIn("npm", dc.names_from_args(["/bin/zsh -lc npm run dev"]))
+
+    def test_unlisted_processes_block_deletion(self):
+        item = {"in_use": ["Xcode"]}
+        cases = (((0, "", ""), "ps"), ((0, "ps: no processes\n", ""), "ps"), ((1, "", "err"), "ps"),
+                 ((None, "", "timed out after 5 s"), "ps"), ((0, "    1 /sbin/launchd\n", ""), None))
+        for result, found in cases:
+            with mock.patch.dict(os.environ, {"DISK_CLEANUP_TEST": "0"}), \
+                    mock.patch.object(dc, "run_cmd", return_value=result), \
+                    mock.patch.object(dc, "which", return_value=found), \
+                    mock.patch.object(dc.os.path, "exists", return_value=bool(found)):
+                self.assertIsNone(dc.running_names(), (result, found))
+                self.assertEqual(dc.Activity().reason(item), "could not list running processes")
+        with mock.patch.dict(os.environ, {"DISK_CLEANUP_TEST": "0"}), \
+                mock.patch.object(dc, "run_cmd", return_value=(0, "    1 /sbin/launchd\n", "")), \
+                mock.patch.object(dc, "which", return_value="ps"):
+            self.assertIn("launchd", dc.running_names())
 
     def test_ps_continuation_lines_are_one_process(self):
         out = ("    1 /sbin/launchd\n"
