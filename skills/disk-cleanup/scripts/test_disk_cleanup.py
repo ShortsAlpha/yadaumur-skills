@@ -837,6 +837,75 @@ class SafetyDetailTest(Base):
             self.assertIn(name, names)
         self.assertNotIn("go", dc.names_from_args(["/usr/bin/say go-build-cache --going"]))
 
+    PROFILE = (";; Seatbelt profile for a simulator helper.\n"
+               ";; XCODE_APP is resolved at launch, not hard-coded to\n"
+               ";; /Applications/Xcode.app: an Xcode-beta or a second Xcode are normal.\n"
+               "(version 1)\n"
+               "(allow process-exec\n"
+               "  (subpath \"/Applications/Xcode.app/Contents/MacOS/Xcode\")\n"
+               "  (subpath (param \"XCODE_APP\")))\n"
+               ";; Xcode Simulator xcodebuild npm\n"
+               "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild\n")
+    WRAPPED = ("/Applications/Some.app/Contents/Helpers/disclaimer -- /usr/bin/sandbox-exec -p " + PROFILE +
+               " -D XCODE_APP=/Applications/Xcode.app -D HOME_DIR=/Users/someone /opt/helper/bin/sim-helper")
+    XCODE = ("Xcode", "xcodebuild", "Simulator")
+
+    def test_process_names_ignore_embedded_text(self):
+        for escaped in (False, True):  # ps prints a line break inside an argument as \012
+            line = self.WRAPPED.replace("\n", "\\012") if escaped else self.WRAPPED
+            names = dc.names_from_args([line])
+            for name in self.XCODE + ("npm",):
+                self.assertNotIn(name, names, (escaped, name))
+            self.assertIn("disclaimer", names)
+            self.assertIn("sandbox-exec", names)
+        for line in ('/usr/bin/log stream --predicate process contains "Xcode" and subsystem == "x"',
+                     "/usr/bin/say Xcode is done", "/usr/bin/env XCODE=/Applications/Xcode.app/Contents/MacOS/Xcode",
+                     "/usr/bin/git commit -m Xcode xcodebuild Simulator fixes",
+                     "/bin/zsh -c source /tmp/snap.sh\\012export X=1\\012xcodebuild -scheme App"):
+            self.assertFalse(set(self.XCODE) & dc.names_from_args([line]), line)
+
+    def test_process_names_still_find_running_tools(self):
+        dev = "/Applications/Xcode.app/Contents/Developer"
+        names = dc.names_from_args([
+            "/Applications/Xcode.app/Contents/MacOS/Xcode",
+            dev + "/usr/bin/xcodebuild -scheme App -destination platform=iOS Simulator,name=iPhone 16",
+            dev + "/Applications/Simulator.app/Contents/MacOS/Simulator -CurrentDeviceUDID ABC"])
+        for name in self.XCODE:
+            self.assertIn(name, names)
+        self.assertIn("Xcode", dc.names_from_args(["/Applications/Xcode 16.app/Contents/MacOS/Xcode"]))
+        self.assertIn("npm", dc.names_from_args(["npm run dev"]))
+        self.assertIn("npm", dc.names_from_args(["/bin/bash -c npm run dev"]))
+        self.assertIn("npm", dc.names_from_args(["node /opt/homebrew/lib/node_modules/npm/bin/npm-cli.js ci"]))
+        self.assertIn("playwright", dc.names_from_args(["node /x/node_modules/playwright/cli.js test"]))
+        self.assertIn("pip", dc.names_from_args(["python3.12 -m pip install -r req.txt"]))
+        self.assertIn("pod", dc.names_from_args(["/usr/bin/ruby /opt/homebrew/bin/pod install"]))
+        self.assertIn("brew", dc.names_from_args(["/bin/bash brew.sh update"]))
+        self.assertIn("gradlew", dc.names_from_args(["/bin/sh ./gradlew assembleDebug"]))
+        self.assertIn("gradle", dc.names_from_args(["/usr/bin/java -cp /a/b.jar:/u/.gradle/w/gradle-wrapper.jar "
+                                                    "org.gradle.wrapper.GradleWrapperMain build"]))
+        self.assertIn("xcodebuild", dc.names_from_args(
+            ["/Applications/Some.app/Contents/Helpers/disclaimer -- " + dev + "/usr/bin/xcodebuild test"]))
+
+    def test_ps_continuation_lines_are_one_process(self):
+        out = ("    1 /sbin/launchd\n"
+               "  950 " + self.WRAPPED + "\n"
+               "12 apples\n"
+               "98765 /usr/bin/true\n"
+               "123456 /usr/local/bin/go build ./...\n")
+        procs = dc.split_ps(out)
+        self.assertEqual([pid for pid, _ in procs], ["1", "950", "98765", "123456"])
+        self.assertEqual(procs[1][1], self.WRAPPED + "\n12 apples")
+        names = dc.names_from_args([args for _, args in procs])
+        self.assertFalse(set(self.XCODE) & names)
+        self.assertNotIn("apples", names)
+        self.assertIn("go", names)
+        with mock.patch.dict(os.environ, {"DISK_CLEANUP_TEST": "0"}), \
+                mock.patch.object(dc, "run_cmd", return_value=(0, out, "")), \
+                mock.patch.object(dc, "which", return_value="ps"):
+            running = dc.running_names()
+        self.assertIn("go", running)
+        self.assertNotIn("Xcode", running)
+
     def test_test_env_needs_the_test_switch(self):
         self.assertEqual(dc.test_env("DISK_CLEANUP_PROCS"), "")
         with mock.patch.dict(os.environ, {"DISK_CLEANUP_TEST": "0"}):

@@ -765,23 +765,77 @@ class Activity:
         return None
 
 
+# A line break inside a command line, raw or as ps prints it (\012, \015).
+ARG_LINE_BREAK = re.compile(r"[\r\n]|\\01[25]")
+# A plain path word: path characters only, at least one slash (no quotes, brackets, "=", prose punctuation).
+PLAIN_PATH = re.compile(r"[\w.+@~,%-]*/[\w.+@~,%/-]*")
+# A bare dotted name: a script file or a class / bundle id (brew.sh, pnpm.cjs, org.gradle...GradleDaemon).
+DOTTED_NAME = re.compile(r"[A-Za-z_$][\w$-]*(?:\.[A-Za-z_$][\w$-]*)+")
+# Programs whose first operand is the program they run (a script, `-m module`, `-c command`).
+INTERPRETER = re.compile(r"(?:sh|bash|zsh|dash|ksh|fish|node|nodejs|bun|deno|"
+                         r"python[\d.]*|pypy[\d.]*|ruby[\d.]*|perl[\d.]*)")
+
+
+def path_names(word, names):
+    """Every path part, also without a script extension (pnpm.cjs -> pnpm, brew.sh -> brew) and as the
+    last part of a dotted name (org.gradle...GradleDaemon -> GradleDaemon, .gradle -> gradle)."""
+    for part in word.split("/"):
+        if not part:
+            continue
+        names.add(part)
+        base, ext = os.path.splitext(part)
+        if ext in SCRIPT_EXTENSIONS and base:
+            names.add(base)
+        if "." in part:
+            names.add(part.rsplit(".", 1)[-1])
+
+
 def names_from_args(lines):
-    """Tool names found anywhere in process command lines, on word and path boundaries: every path part,
-    without a script extension (pnpm.cjs -> pnpm, brew.sh -> brew), and the last part of a dotted name
-    (org.gradle...GradleDaemon -> GradleDaemon). `python -m pip` gives pip."""
+    """Tool names of running programs, one process command line per entry. A process names:
+    its executable (first word: every path part, Xcode.app/Contents/MacOS/Xcode -> Xcode); later words
+    that are plain paths (node .../pnpm.cjs -> pnpm, bash .../brew.sh -> brew, a classpath under
+    .gradle -> gradle; colon lists are split) or bare dotted names (org.gradle...GradleDaemon ->
+    GradleDaemon); and the first operand of a shell or interpreter (`python -m pip` -> pip,
+    `bash -c npm ...` -> npm). Plain words, quoted text, KEY=value and everything after the first line
+    break (the body of an inline script or profile) name nothing: wrappers (disclaimer --, sandbox-exec,
+    env, xcrun) start the real program as its own process, which is listed on its own."""
     names = set()
     for line in lines:
-        for word in line.split():
-            for part in word.split("/"):
-                if not part:
+        words = ARG_LINE_BREAK.split(line, 1)[0].split()
+        if not words:
+            continue
+        path_names(words[0], names)
+        program = os.path.basename(words[0])
+        operand_due = bool(INTERPRETER.fullmatch(program))
+        for word in words[1:]:
+            if operand_due and not word.startswith("-"):
+                operand_due = False
+                if "/" not in word:
+                    path_names(word, names)
                     continue
-                names.add(part)
-                base, ext = os.path.splitext(part)
-                if ext in SCRIPT_EXTENSIONS and base:
-                    names.add(base)
-                if "." in part:
-                    names.add(part.rsplit(".", 1)[-1])
+            if word.startswith("-") or "=" in word:
+                continue
+            for piece in word.split(":"):
+                if PLAIN_PATH.fullmatch(piece) or DOTTED_NAME.fullmatch(piece):
+                    path_names(piece, names)
     return names
+
+
+def split_ps(out):
+    """[(pid, args)] from `ps -o pid=,args=` output. ps right-aligns the pid column (a longer pid may
+    overflow it), so a line that does not start with a pid at least that wide continues the previous
+    command line: an argument with raw line breaks in it."""
+    procs = []
+    width = None
+    for line in out.splitlines():
+        match = re.match(r"( *\d+)(?: |$)", line)
+        if match and width is None:
+            width = len(match.group(1))
+        if match and len(match.group(1)) >= width:
+            procs.append([match.group(1).strip(), line[match.end():]])
+        elif procs:
+            procs[-1][1] += "\n" + line
+    return [tuple(proc) for proc in procs]
 
 
 def running_names():
@@ -795,12 +849,7 @@ def running_names():
     if code != 0:
         return None
     mine = {str(os.getpid()), str(os.getppid())}
-    lines = []
-    for line in out.splitlines():
-        pid, _, args = line.strip().partition(" ")
-        if pid not in mine:
-            lines.append(args)
-    return names_from_args(lines)
+    return names_from_args([args for pid, args in split_ps(out) if pid not in mine])
 
 
 def booted_simulators():
