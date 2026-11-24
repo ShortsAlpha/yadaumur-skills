@@ -52,11 +52,19 @@ MB = 1000 ** 2
 DAY = 86400
 DEFAULTS = {"interval_days": 7, "min_free_gb": 25, "min_free_pct": 10, "critical_free_gb": 10,
             "nag_hours": 20, "critical_nag_hours": 2, "stale_days": 30,
-            "project_roots": None, "exclude": [], "hide": []}
+            "project_roots": None, "home_projects": True, "exclude": [], "hide": []}
 NUMBER_KEYS = ("interval_days", "min_free_gb", "min_free_pct", "critical_free_gb", "nag_hours",
                "critical_nag_hours", "stale_days")
 LIST_KEYS = ("project_roots", "exclude", "hide")
+BOOL_KEYS = ("home_projects",)
 DEFAULT_ROOTS = ("Developer", "Projects", "code", "src", "dev", "repos")
+# home_projects: direct children of the home folder holding one of these are projects too (~/my-app). Never looked
+# into: dot folders, links, these folders (Desktop, Documents, Downloads and iCloud are privacy-protected: even
+# listing them can make macOS ask for access) and anything starting with "iCloud".
+HOME_PROJECT_MARKERS = (".git", "package.json", "Package.swift", "Podfile", "Cargo.toml", "pyproject.toml", "go.mod",
+                        "build.gradle", "build.gradle.kts", "*.xcodeproj", "*.xcworkspace")
+HOME_NOT_PROJECTS = ("Library", "Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures", "Public",
+                     "Applications", "Sites")
 SCAN_MAX_AGE = DAY            # clean --yes only trusts a scan younger than this
 SCAN_TOTAL = 130              # seconds for a whole scan (discovery + sizing); unfinished sizes are lower bounds
 TARGET_TIMEOUT = 30           # seconds to size one target
@@ -69,6 +77,11 @@ ACTIVITY_MAX_ENTRIES = 20000  # per project; a project too big to check is treat
 CLAUDE_TEMP_DAYS = 7
 DOWNLOAD_MIN_BYTES = GB
 DOWNLOAD_DAYS = 30
+SIM_DATA_MIN_BYTES = 500 * MB  # a simulator's data (simctl dataPathSize) below this is not listed: ~20 MB after an
+                               # erase, and a device booted once regrows its basics anyway
+# Everything a DerivedData folder may hold, besides *.noindex folders (Index.noindex, ModuleCache.noindex, ...).
+DERIVED_DATA_NAMES = {"Build", "Index", "Logs", "SourcePackages", "TextIndex", "info.plist", ".DS_Store"}
+DD_SEARCH_DEPTH = 3            # custom DerivedData below a project's .claude folder (.claude/worktrees/_dd/<name>)
 TRANSCRIPT_MIN_AGE = DAY      # never list a transcript touched in the last day (a session may be using it)
 GROWTH_MIN_BYTES = 500 * MB
 NEW_ITEM_MIN_BYTES = GB
@@ -115,10 +128,12 @@ CATALOG = (
      "in_use": ("brew", "brew.sh"),
      "note": "Downloaded bottles and sources (brew cleanup also drops old formula versions); "
              "re-downloaded only when needed again."},
-    {"id": "npm-cache", "tier": "A", "title": "npm cache", "paths": [".npm/_cacache", ".npm/_npx"],
-     "tool": "npm", "command": ["npm", "cache", "clean", "--force"], "covers": [".npm/_cacache"],
-     "in_use": ("npm", "npx"),
-     "note": "Package cache and npx installs; re-downloads on the next npm install / npx run."},
+    {"id": "npm-cache", "tier": "A", "title": "npm cache", "paths": [".npm/_cacache"],
+     "tool": "npm", "command": ["npm", "cache", "clean", "--force"], "in_use": ("npm:cache",),
+     "note": "Package cache; re-downloads on the next npm install."},
+    {"id": "npx-cache", "tier": "A", "title": "npx installs", "paths": [".npm/_npx"], "in_use": ("npm:exec", "_npx"),
+     "note": "Packages npx installed to run them (often MCP servers); re-downloaded on the next npx run. Kept "
+             "while npx runs or a program runs from it."},
     {"id": "pnpm-store", "tier": "A", "title": "pnpm store", "paths": ["Library/pnpm/store"],
      "tool": "pnpm", "command": ["pnpm", "store", "prune"], "in_use": ("pnpm",),
      "note": "pnpm store; prune frees only packages no project references (without pnpm the folder is "
@@ -415,6 +430,11 @@ def load_config():
                 cfg[key] = list(value)
             else:
                 warnings.append("%s: expected a list of strings, ignored" % key)
+        elif key in BOOL_KEYS:
+            if isinstance(value, bool):
+                cfg[key] = value
+            else:
+                warnings.append("%s: expected true or false, using %s" % (key, json.dumps(DEFAULTS[key])))
         else:
             warnings.append("unknown key %s, ignored" % key)
     if cfg["project_roots"] is None:
@@ -628,12 +648,15 @@ class Context:
         self.roots = [expand(r) for r in cfg["project_roots"]]
         self.excludes = [real(expand(e)) for e in cfg["exclude"]]
         self.hide = set(cfg["hide"])
+        self.home_projects = home_projects(self) if cfg.get("home_projects", True) else []
         protected = [hpath(rel) for rel in HOME_PROTECTED]
         for pattern in HOME_PROTECTED_GLOBS:
             protected += glob.glob(hpath(pattern))
-        protected += self.roots + [self.tmp] + self.tmp_containers + ([self.systmp] if self.systmp else [])
+        protected += self.roots + self.home_projects + [self.tmp] + self.tmp_containers + \
+            ([self.systmp] if self.systmp else [])
         self.protected = [real(p) for p in protected]
         self.roots_real = [real(r) for r in self.roots]
+        self.home_projects_real = [real(p) for p in self.home_projects]
 
     def time_left(self):
         return self.deadline - time.monotonic()
@@ -644,6 +667,47 @@ class Context:
             return False
         loc = real_loc(path)
         return any(loc == ex or under(loc, ex) or (containing and under(ex, loc)) for ex in self.excludes)
+
+
+def home_projects(ctx):
+    """Projects directly in the home folder (a child holding one of HOME_PROJECT_MARKERS) or one level below a child
+    that holds none (a workspace folder: ~/my-ws/App with the repo, next to screenshots/), unless a project root
+    already covers them. Never looked into: dot folders, links, HOME_NOT_PROJECTS, iCloud; no deeper descent."""
+    roots = [real(r) for r in ctx.roots]
+    if ctx.home_real in roots:
+        return []  # the home folder itself is a project root: its children are walked anyway
+    skip = {name.casefold() for name in HOME_NOT_PROJECTS}
+
+    def candidates(folder, top):
+        """[(path, child names)] of the folder's usable child folders."""
+        try:
+            entries = sorted(os.scandir(folder), key=lambda e: e.name)
+        except OSError:
+            return []
+        out = []
+        for entry in entries:
+            name = entry.name
+            if name.startswith(".") or not entry_is_dir(entry) or \
+                    (top and (name.casefold() in skip or name.casefold().startswith("icloud"))) or \
+                    (not top and name in PROJECT_ARTIFACTS):
+                continue
+            loc = real(entry.path)
+            if any(loc == r or under(loc, r) or under(r, loc) for r in roots) or ctx.excluded(entry.path):
+                continue
+            try:
+                with os.scandir(entry.path) as it:
+                    out.append((entry.path, [e.name for e in it]))
+            except OSError:
+                continue
+        return out
+
+    found = []
+    for path, names in candidates(ctx.home, True):
+        if marker_ok(names, HOME_PROJECT_MARKERS):
+            found.append(path)
+        else:
+            found += [sub for sub, sub_names in candidates(path, False) if marker_ok(sub_names, HOME_PROJECT_MARKERS)]
+    return found
 
 
 def check_path(path, item, ctx):
@@ -664,10 +728,14 @@ def check_path(path, item, ctx):
         return "outside the home folder"
     if ctx.excluded(path):
         return "excluded in config"
+    if (item.get("meta") or {}).get("derived_data") and not is_derived_data(path):
+        return "no longer a DerivedData folder (holds other files now): rescan"
     if project:
         if not under(loc, real(project)):
             return "not inside its project"
-        if not any(under(real(project), root) for root in ctx.roots_real):
+        project_real = real(project)
+        if not any(under(project_real, root) for root in ctx.roots_real) and \
+                not any(project_real == p or under(project_real, p) for p in ctx.home_projects_real):
             return "project is not inside a project root"
     return None
 
@@ -751,6 +819,9 @@ class Activity:
         return self._booted
 
     def reason(self, item):
+        meta = item.get("meta") or {}
+        if meta.get("sim_state") not in (None, "Shutdown"):  # simctl's state from the fresh discovery
+            return "simulator %s is %s" % (meta.get("sim_name") or meta.get("udid"), meta["sim_state"].lower())
         names = item.get("in_use") or ()
         if not names:
             return None
@@ -759,8 +830,8 @@ class Activity:
             return "could not list running processes"
         for name in names:
             if name in running:
-                return "%s is running" % name
-        if any(name in XCODE for name in names) and self.booted():
+                return "%s is running" % IN_USE_LABELS.get(name, name)
+        if any(name in XCODE for name in names) and "sim_state" not in meta and self.booted():
             return "a simulator is booted"
         return None
 
@@ -781,6 +852,20 @@ INTERPRETER = re.compile(r"(?:sh|bash|zsh|dash|ksh|fish|node|nodejs|bun|deno|"
 PROGRAM_OPTION = re.compile(r"-[A-Za-z]*[mc]")
 # Scripts that run the next word's tool inside their own process: corepack pnpm install.
 LAUNCHERS = ("corepack",)
+# Which npm command a process runs decides what it uses: script commands run the project's own code (npm run dev,
+# npm start: a dev server from the project's node_modules) and use neither cache; npx / npm exec run a package from
+# ~/.npm/_npx; anything else (install, ci, update, cache, unknown) uses the package cache.
+NPM_PROGRAMS = ("npm", "npm-cli")
+NPX_PROGRAMS = ("npx", "npx-cli")
+NPM_SCRIPT_COMMANDS = ("run", "run-script", "rum", "urn", "start", "test", "tst", "t", "restart", "stop")
+NPM_EXEC_COMMANDS = ("exec", "x")
+# npm create <pkg> / npm init <pkg> install the package into ~/.npm/_npx through the cache and run it: both.
+NPM_CREATE_COMMANDS = ("create", "init", "innit")
+NPM_VALUE_OPTIONS = ("--prefix", "-C", "--workspace", "-w", "--cache", "--userconfig", "--globalconfig",
+                     "--registry", "--loglevel", "--location", "--script-shell")
+# Synthetic in-use names and how a skip reason reads them.
+IN_USE_LABELS = {"npm:cache": "npm (a command that uses its package cache)", "npm:exec": "npx (npm exec)",
+                 "_npx": "a program from the npx cache"}
 
 
 def path_names(word, names):
@@ -802,6 +887,32 @@ def program_name(word):
     return word.split("@", 1)[0] if not word.startswith("@") else word
 
 
+def npm_tokens(words, named):
+    """For a process whose words name npm or npx: {"npm:cache"} when it runs an npm command that uses the package
+    cache (also an unknown or missing one), {"npm:exec"} for npx / npm exec, both for npm create / npm init <pkg>,
+    nothing for a script command."""
+    if not named & set(NPM_PROGRAMS + NPX_PROGRAMS):
+        return set()
+    for index, word in enumerate(words):
+        program = os.path.splitext(program_name(os.path.basename(word)))[0]  # npm@10.2.0 -> npm
+        if program in NPX_PROGRAMS:
+            return {"npm:exec"}
+        if program not in NPM_PROGRAMS:
+            continue
+        rest = iter(words[index + 1:])
+        for arg in rest:
+            if arg in NPM_VALUE_OPTIONS:
+                next(rest, None)
+            elif not arg.startswith("-"):
+                if arg in NPM_SCRIPT_COMMANDS:
+                    return set()
+                if arg in NPM_CREATE_COMMANDS and (arg == "create" or any(not a.startswith("-") for a in rest)):
+                    return {"npm:cache", "npm:exec"}
+                return {"npm:exec"} if arg in NPM_EXEC_COMMANDS else {"npm:cache"}
+        return {"npm:cache"}
+    return set()  # named only as a folder (~/.npm/...): not npm itself
+
+
 def names_from_args(lines):
     """Tool names of running programs, one process command line per entry. A process names:
     its executable (first word: every path part, Xcode.app/Contents/MacOS/Xcode -> Xcode); later words
@@ -811,12 +922,14 @@ def names_from_args(lines):
     (`python -X utf8 -m pip` -> pip, `bash -lc npm ...` -> npm); and the word after a launcher script
     (`node .../corepack pnpm install` -> pnpm). Plain words, quoted text, KEY=value and everything after
     the first line break (the body of an inline script or profile) name nothing: wrappers (disclaimer --,
-    sandbox-exec, env, xcrun) start the real program as its own process, which is listed on its own."""
-    names = set()
+    sandbox-exec, env, xcrun) start the real program as its own process, which is listed on its own.
+    A process naming npm or npx also adds what it uses (npm_tokens: npm:cache, npm:exec)."""
+    all_names = set()
     for line in lines:
         words = ARG_LINE_BREAK.split(line, 1)[0].split()
         if not words:
             continue
+        names = set()
         path_names(words[0], names)
         interpreter = bool(INTERPRETER.fullmatch(os.path.basename(words[0])))
         operand_due = interpreter or os.path.splitext(os.path.basename(words[0]))[0] in LAUNCHERS
@@ -840,7 +953,8 @@ def names_from_args(lines):
                 path_names(piece, names)
                 if os.path.splitext(piece.rsplit("/", 1)[-1])[0] in LAUNCHERS:
                     operand_due = True
-    return names
+        all_names |= names | npm_tokens(words, names)
+    return all_names
 
 
 def split_ps(out):
@@ -1024,7 +1138,7 @@ def note_missing_clt(ctx, what):
 
 
 def find_simulators(ctx, only):
-    if not wants(only, "simulators-unavailable", "sim-runtime:") or not which("xcrun"):
+    if not wants(only, "simulators-unavailable", "sim-runtime:", "sim-data:") or not which("xcrun"):
         return []
     if not tool("xcrun"):
         note_missing_clt(ctx, "simulator items")
@@ -1045,6 +1159,8 @@ def find_simulators(ctx, only):
                 "Simulators whose runtime is gone; removed with xcrun simctl delete unavailable.", paths,
                 commands=[["xcrun", "simctl", "delete", "unavailable"]], remove=[], in_use=XCODE,
                 size_bytes=None if paths else 0))
+    if wants(only, "sim-data:"):
+        items += simulator_data_items(devices)
     if wants(only, "sim-runtime:"):
         runtimes = simctl_json(["runtime", "list", "-j"])
         if isinstance(runtimes, dict):
@@ -1075,6 +1191,45 @@ def find_simulators(ctx, only):
                                        commands=[["xcrun", "simctl", "runtime", "delete", ident]] if deletable else [],
                                        deletable=deletable, in_use=XCODE, meta={"runtime": ident},
                                        size_bytes=size if isinstance(size, int) else None))
+    return items
+
+
+UDID = re.compile(r"[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}")
+
+
+def simulator_data_items(devices):
+    """One item per available simulator whose data is at least SIM_DATA_MIN_BYTES (simctl's dataPathSize; listed
+    when simctl gives none): xcrun simctl erase empties it, the device itself stays. Unavailable devices belong to
+    simulators-unavailable; XCTest clones and preview devices live in their own device sets (other items)."""
+    items, base = [], hpath("Library/Developer/CoreSimulator/Devices")
+    for runtime, group in sorted(devices.items()):
+        if not isinstance(group, list):
+            continue
+        os_label = runtime.rsplit(".", 1)[-1].replace("-", " ", 1).replace("-", ".")  # iOS-18-6 -> iOS 18.6
+        for device in group:
+            if not isinstance(device, dict) or device.get("isAvailable") is False:
+                continue
+            udid = device.get("udid")
+            if not isinstance(udid, str) or not UDID.fullmatch(udid):
+                continue
+            size = device.get("dataPathSize")
+            if isinstance(size, int) and not isinstance(size, bool) and size < SIM_DATA_MIN_BYTES:
+                continue
+            data = os.path.join(base, udid, "data")
+            if not is_dir(data):
+                continue
+            name = str(device.get("name") or udid)
+            state = str(device.get("state") or "unknown")
+            slug = re.sub(r"[^A-Za-z0-9.]+", "-", name).strip("-")
+            note = ("Contents and settings of simulator %s (%s): installed apps, their data, logins; xcrun simctl "
+                    "erase resets it, the device stays. du over-counts APFS clones here: the real gain is smaller "
+                    "and macOS releases it in the background over a few minutes." % (name, os_label))
+            if state != "Shutdown":
+                note += " %s now: skipped until it is shut down." % state
+            items.append(make_item("sim-data:%s-%s" % (slug, udid[:8]), "B",
+                                   "Simulator data: %s (%s)" % (name, os_label), note, [data], remove=[],
+                                   commands=[["xcrun", "simctl", "erase", udid]], in_use=("xcodebuild",),
+                                   meta={"udid": udid, "sim_name": name, "sim_state": state, "runtime": runtime}))
     return items
 
 
@@ -1123,30 +1278,83 @@ def git_root_above(path, ctx):
     return None
 
 
+def derived_data_layout(folder, entries):
+    """Xcode's DerivedData layout (a custom xcodebuild -derivedDataPath): info.plist and Build/, plus a WorkspacePath
+    in the plist or a *.noindex folder, and nothing but DERIVED_DATA_NAMES and *.noindex folders. A folder that also
+    holds sources, a project marker, .git or anything else (-derivedDataPath . in a project, an agent worktree, a
+    folder with screenshots next to the build data) is not one. Exact case: an app's Info.plist next to a build/
+    folder is not one."""
+    names = {e.name for e in entries}
+    dirs = {e.name for e in entries if entry_is_dir(e)}
+    if "info.plist" not in names or "Build" not in dirs:
+        return False
+    if any(name not in DERIVED_DATA_NAMES and not (name.endswith(".noindex") and name in dirs) for name in names):
+        return False
+    return any(name.endswith(".noindex") for name in dirs) or workspace_path(folder) is not None
+
+
+def is_derived_data(folder):
+    """derived_data_layout, read from disk now (clean checks it again right before deleting)."""
+    if not is_dir(folder):
+        return False
+    try:
+        with os.scandir(folder) as it:
+            entries = list(it)
+    except OSError:
+        return False
+    return derived_data_layout(folder, entries)
+
+
 def walk_projects(ctx):
-    """([(artifact, project_dir, repo or None, repo_rules)], [git repos]) under the project roots. The project of an
-    artifact is the folder that holds it (and its marker); a project_roots entry itself is never a project."""
-    found, repos = [], []
+    """([(artifact, project_dir, repo or None, repo_rules)], [git repos], [(derived data folder, repo or None)]) under
+    the project roots and the home-folder projects. The project of an artifact is the folder that holds it (and its
+    marker); a project_roots entry itself is never a project. A folder with the DerivedData layout is listed itself
+    and not looked into; below dot folders only a project's .claude folder is searched for one, DD_SEARCH_DEPTH
+    levels deep (.claude/worktrees/_dd/<name>)."""
+    found, repos, derived = [], [], []
     deadline = min(time.monotonic() + WALK_BUDGET, ctx.deadline)
     visited = [0]
     roots = {norm(r) for r in ctx.roots}
+    library = real(hpath("Library"))  # ~/Library/Developer/Xcode/DerivedData is find_derived_data's
 
-    def walk(folder, depth, repo):
+    def listing(folder):
         visited[0] += 1
         if visited[0] > WALK_MAX_DIRS or time.monotonic() > deadline:
-            return
+            return None
         try:
             with os.scandir(folder) as it:
-                entries = list(it)
+                return list(it)
         except OSError:
+            return None
+
+    def derived_data(folder, entries, repo):
+        if not derived_data_layout(folder, entries):
+            return False
+        if not under(real(folder), library) and not ctx.excluded(folder):
+            derived.append((folder, repo))
+        return True
+
+    def search_claude(folder, depth, repo):
+        entries = listing(folder)
+        if entries is None or (depth and derived_data(folder, entries, repo)) or depth >= DD_SEARCH_DEPTH:
+            return
+        for entry in entries:
+            if entry_is_dir(entry) and not ctx.excluded(entry.path, containing=False):
+                search_claude(entry.path, depth + 1, repo)
+
+    def walk(folder, depth, repo):
+        entries = listing(folder)
+        if entries is None:
             return
         names = [e.name for e in entries]
+        is_root = norm(folder) in roots
         git = next((e for e in entries if e.name == ".git"), None)
         if git is not None:
             repo = folder
             if git.is_dir(follow_symlinks=False):
                 repos.append(folder)
-        is_root = norm(folder) in roots
+        if git is None and not is_root and derived_data(folder, entries, repo):
+            return
         for entry in entries:
             if not entry_is_dir(entry):
                 continue
@@ -1157,6 +1365,8 @@ def walk_projects(ctx):
                     repo_rules = entry.name == "build" and not marker_ok(names, BUILD_MARKERS_NO_GIT)
                     found.append((entry.path, folder, repo, repo_rules))
                 continue  # never descend into artifact folders
+            if entry.name == ".claude" and not ctx.excluded(entry.path, containing=False):
+                search_claude(entry.path, 0, repo)
             if entry.name.startswith(".") or depth >= WALK_MAX_DEPTH or ctx.excluded(entry.path, containing=False):
                 continue
             walk(entry.path, depth + 1, repo)
@@ -1164,7 +1374,9 @@ def walk_projects(ctx):
     for root in ctx.roots:
         if is_dir(root):
             walk(root, 0, git_root_above(root, ctx))
-    return found, repos
+    for project in ctx.home_projects:  # as if the home folder were a root
+        walk(project, len(rel_home(project).split("/")), git_root_above(project, ctx))
+    return found, repos, derived
 
 
 def ignore_rule_is_the_repos(source, repo):
@@ -1320,11 +1532,11 @@ def worktree_blocker(git, path):
 
 
 def find_projects(ctx, only):
-    if not wants(only, "project:", "worktree:"):
+    if not wants(only, "project:", "worktree:", "derived-data:"):
         return []
-    found, repos = walk_projects(ctx)
+    found, repos, derived = walk_projects(ctx)
     items = []
-    needs_git = bool(repos) or any(repo for _, _, repo, _ in found)
+    needs_git = bool(repos) or any(repo for _, _, repo, _ in found) or any(repo for _, repo in derived)
     git = tool("git") if needs_git else None
     if needs_git and not git:
         if which("git"):
@@ -1356,6 +1568,8 @@ def find_projects(ctx, only):
                 kinds, fmt_age(ctx.now - last), state)
             items.append(make_item("project:" + rel_home(project), "B", "Build artifacts of %s" % rel_home(project),
                                    note, sorted(artifacts), meta={"project_dir": project, "active": active}))
+    if wants(only, "derived-data:"):
+        items += custom_derived_data_items(ctx, derived, git)
     if wants(only, "worktree:") and git:
         for repo in sorted(repos):
             base = os.path.join(repo, ".claude", "worktrees")
@@ -1378,6 +1592,34 @@ def find_projects(ctx, only):
                     "its branch and commits are kept." % (rel_home(repo), fmt_age(ctx.now - last)),
                     [entry.path], remove=[], commands=[["git", "-C", repo, "worktree", "remove", entry.path]],
                     meta={"repo": repo, "worktree": entry.path}))
+    return items
+
+
+def custom_derived_data_items(ctx, derived, git):
+    """One item per DerivedData folder inside a project (xcodebuild -derivedDataPath), tiered like
+    ~/Library/Developer/Xcode/DerivedData: A when its project is gone or it was not built for stale_days, else B.
+    Only the folder itself goes, never its parent (screenshots or other output may sit next to it). Inside a git
+    repo it must hold no tracked file."""
+    items = []
+    for path, repo in sorted(derived):
+        if repo is not None:
+            if not git or ctx.time_left() <= 0:
+                continue
+            code, out, _ = run_cmd([git, "-C", repo, "ls-files", "--", path], QUERY_TIMEOUT)
+            if code != 0 or out.strip():
+                continue
+        workspace = workspace_path(path)
+        age = ctx.now - (recent_mtime(path, 2) or ctx.now)
+        if workspace and workspace_gone(workspace):
+            tier, state = "A", "its project no longer exists, nothing will rebuild it"
+        elif age >= ctx.stale:
+            tier, state = "A", "not built for %s; the next build with this path starts from scratch" % fmt_age(age)
+        else:
+            tier, state = "B", "built %s ago; the next build with this path is a full rebuild" % fmt_age(age)
+        note = "Xcode build data at a custom -derivedDataPath%s: %s. Only this folder is removed." % (
+            " for %s" % rel_home(workspace) if workspace else "", state)
+        items.append(make_item("derived-data:" + rel_home(path), tier, "DerivedData at %s" % rel_home(path), note,
+                               [path], in_use=XCODE, meta={"workspace": workspace, "derived_data": True}))
     return items
 
 
@@ -2008,6 +2250,12 @@ def cmd_config():
                      exclude=[expand(e) for e in cfg["exclude"]])
     print("config file: %s (%s)" % (config_path(), "exists" if os.path.exists(config_path()) else
                                     "not found, defaults in use"))
+    if cfg["home_projects"]:
+        found = home_projects(Context(cfg))
+        print("home_projects: projects directly in the home folder are scanned too (false turns this off): %s"
+              % (", ".join("~/" + rel_home(p) for p in found) or "none found"))
+    else:
+        print("home_projects: off (only project_roots are scanned)")
     print(json.dumps(effective, indent=2, sort_keys=True))
     for warning in warnings:
         print("warning: " + warning)

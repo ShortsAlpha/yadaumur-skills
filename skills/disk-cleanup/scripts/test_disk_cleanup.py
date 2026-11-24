@@ -209,7 +209,8 @@ class Base(unittest.TestCase):
             self.age(path, 60 if "claude" not in str(path) else 10)
         self.mk(transcripts / "new.jsonl")
 
-    EXPECTED = {"derived-data-orphans": "A", "derived-data-stale": "A", "npm-cache": "A", "yarn-cache": "A",
+    EXPECTED = {"derived-data-orphans": "A", "derived-data-stale": "A", "npm-cache": "A", "npx-cache": "A",
+                "yarn-cache": "A",
                 "claude-temp": "A", "derived-data-active": "B", "playwright-browsers": "B",
                 "project:Developer/old-web": "B", "project:Developer/old-swift": "B",
                 "project:Developer/old-ios": "B", "project:Developer/old-mono": "B",
@@ -343,8 +344,8 @@ class CleanTest(Base):
         self.scan()
         before = set(str(p) for p in self.tmp.rglob("*"))
         with mock.patch.object(dc, "disk_usage", side_effect=[(100 * GB, self.TOTAL), (103 * GB, self.TOTAL)]):
-            code, out, err = self.cli("clean", "npm-cache", "derived-data-orphans", "project:Developer/old-web",
-                                      "--yes")
+            code, out, err = self.cli("clean", "npm-cache", "npx-cache", "derived-data-orphans",
+                                      "project:Developer/old-web", "--yes")
         self.assertEqual(code, 0, out + err)
         self.assertIn("really freed +3.0 GB", out)
         gone = [self.h(".npm/_cacache"), self.h(".npm/_npx"), self.h("Library/Developer/Xcode/DerivedData/Gone-abc"),
@@ -360,7 +361,7 @@ class CleanTest(Base):
             self.assertTrue(path.exists(), path)
         record = self.history()[-1]
         self.assertEqual(record["type"], "clean")
-        self.assertEqual(sorted(record["ids"]), sorted(["npm-cache", "derived-data-orphans",
+        self.assertEqual(sorted(record["ids"]), sorted(["npm-cache", "npx-cache", "derived-data-orphans",
                                                         "project:Developer/old-web"]))
         self.assertEqual(record["freed"], 3 * GB)
         self.assertGreater(record["estimated"], 0)
@@ -466,9 +467,9 @@ class CleanTest(Base):
         self.assertIn("in use: Xcode is running", out)
         self.assertTrue(self.h("Library/Developer/Xcode/DerivedData/Gone-abc").exists())
         self.assertFalse(self.h("Library/Caches/Yarn").exists())
-        code, out, _ = self.cli("clean", "npm-cache", "--yes", env={"DISK_CLEANUP_PROCS": "npm"})
+        code, out, _ = self.cli("clean", "npm-cache", "--yes", env={"DISK_CLEANUP_PROCS": "npm:cache"})
         self.assertEqual(code, 1)
-        self.assertIn("npm is running", out)
+        self.assertIn("in use: npm (a command that uses its package cache) is running", out)
         self.assertTrue(self.h(".npm/_cacache/index").exists())
 
     def test_tool_command_and_fallback(self):
@@ -480,11 +481,11 @@ class CleanTest(Base):
             self.scan()
             code, out, _ = self.cli("clean", "npm-cache")
             self.assertIn("run:    /stub/npm cache clean --force", out)
-            code, out, err = self.cli("clean", "npm-cache", "--yes")
+            code, out, err = self.cli("clean", "npm-cache", "npx-cache", "--yes")
         self.assertEqual(code, 0, out + err)
         self.assertEqual(calls, [["/stub/npm", "cache", "clean", "--force"]])
         self.assertTrue(self.h(".npm/_cacache/index").exists())  # the command's job (stubbed here)
-        self.assertFalse(self.h(".npm/_npx").exists())           # not covered by the command: removed directly
+        self.assertFalse(self.h(".npm/_npx").exists())           # npx-cache: removed directly
         with mock.patch.object(dc, "which", lambda name: tools.get(name)), \
                 mock.patch.object(dc, "run_cmd", lambda argv, timeout: (1, "", "npm ERR! boom")):
             self.scan()
@@ -979,6 +980,324 @@ class SafetyDetailTest(Base):
         self.assertFalse((self.systmp / "claude-501/old-sess").exists())
         self.assertTrue((self.systmp / "claude-501/new-sess").exists())
         self.assertTrue((self.systmp / "other/old/x").exists())
+
+
+class ScanGapsTest(Base):
+    """Simulator device data, home-folder projects, custom DerivedData folders, npm cache use."""
+    BIG, SMALL, BOOTED, DEAD = ("11111111-2222-3333-4444-555555555555", "AAAAAAAA-2222-3333-4444-555555555555",
+                                "BBBBBBBB-2222-3333-4444-555555555555", "DDDDDDDD-2222-3333-4444-555555555555")
+
+    def simctl(self, calls):
+        runtime = "com.apple.CoreSimulator.SimRuntime.iOS-18-6"
+        devices = [{"udid": self.BIG, "name": "iPhone 16 Pro", "state": "Shutdown", "isAvailable": True,
+                    "dataPathSize": 3 * GB},
+                   {"udid": self.SMALL, "name": "iPhone 16", "state": "Shutdown", "isAvailable": True,
+                    "dataPathSize": 18 * 1000 ** 2},
+                   {"udid": self.BOOTED, "name": "iPad Air", "state": "Booted", "isAvailable": True,
+                    "dataPathSize": 2 * GB},
+                   {"udid": self.DEAD, "name": "Old Phone", "state": "Shutdown", "isAvailable": False,
+                    "dataPathSize": 2 * GB}]
+        for device in devices:
+            self.mk(self.h("Library/Developer/CoreSimulator/Devices/%s/data/Containers/x" % device["udid"]))
+
+        def fake_run(argv, timeout):
+            calls.append(argv)
+            if argv[1:] == ["simctl", "list", "-j", "devices"]:
+                return 0, json.dumps({"devices": {runtime: devices}}), ""
+            if argv[1:3] == ["simctl", "runtime"]:
+                return 1, "", "no runtimes"
+            return 0, "", ""
+        return mock.patch.object(dc, "which", lambda name: "/stub/xcrun" if name == "xcrun" else None), \
+            mock.patch.object(dc, "run_cmd", fake_run)
+
+    def test_simulator_data_is_erased_not_deleted(self):
+        calls = []
+        which, run = self.simctl(calls)
+        with which, run:
+            result = self.scan()
+            ids = self.ids(result)
+            big, booted = "sim-data:iPhone-16-Pro-11111111", "sim-data:iPad-Air-BBBBBBBB"
+            self.assertEqual(ids[big], "B")
+            self.assertEqual(ids[booted], "B")
+            self.assertEqual(ids["simulators-unavailable"], "A")  # the unavailable device is only listed there
+            self.assertEqual(sorted(i for i in ids if i.startswith("sim-data:")), sorted([big, booted]))
+            item = self.item(result, big)
+            device = self.h("Library/Developer/CoreSimulator/Devices/" + self.BIG)
+            self.assertEqual(item["paths"], [str(device / "data")])
+            self.assertEqual(item["commands"], [["xcrun", "simctl", "erase", self.BIG]])
+            self.assertIn("iOS 18.6", item["title"])
+            self.assertIn("APFS", item["note"])
+            self.assertIn("Booted now", self.item(result, booted)["note"])
+            code, out, _ = self.cli("clean", big, booted)
+            self.assertIn("run:    /stub/xcrun simctl erase " + self.BIG, out)
+            self.assertNotIn("remove:", out)
+            self.assertIn(booted + ": skip: in use: simulator iPad Air is booted", out)
+            code, out, _ = self.cli("clean", big, "--yes", env={"DISK_CLEANUP_PROCS": "xcodebuild"})
+            self.assertIn("in use: xcodebuild is running", out)
+            code, out, _ = self.cli("clean", big, booted, "--yes")
+        self.assertEqual(code, 1, out)
+        self.assertIn(big + ": done: ran xcrun simctl erase " + self.BIG, out)
+        self.assertIn(booted + ": skipped: in use: simulator iPad Air is booted", out)
+        self.assertIn(["/stub/xcrun", "simctl", "erase", self.BIG], calls)
+        self.assertNotIn(["/stub/xcrun", "simctl", "erase", self.BOOTED], calls)
+        self.assertTrue((device / "data" / "Containers" / "x").exists())  # simctl's job (stubbed): never removed here
+
+    def test_home_folder_projects(self):
+        self.fixture()
+        self.mk(self.h("my-app/package.json"), b"{}")
+        self.mk(self.h("my-app/node_modules/a/index.js"))
+        self.mk(self.h("live-app/package.json"), b"{}")
+        self.mk(self.h("live-app/node_modules/a/index.js"))
+        self.mk(self.h("notes/todo.txt"))                          # no project marker
+        self.mk(self.h("notes/node_modules/x"))
+        for rel in ("Documents/doc-app", "Desktop/desk-app", "Downloads/dl-app", ".hidden-app", "iCloud Drive/app"):
+            self.mk(self.h(rel + "/package.json"), b"{}")
+            self.mk(self.h(rel + "/node_modules/x"))
+        make_link(str(self.h("my-app")), str(self.h("linked-app")))
+        for rel in ("my-app", "notes", "Documents", "Desktop", "Downloads", ".hidden-app", "iCloud Drive"):
+            self.age(self.h(rel), 60)
+        listed = []
+        real_scandir = os.scandir
+
+        def scandir(path="."):
+            listed.append(os.path.normcase(os.path.abspath(str(path))))
+            return real_scandir(path)
+
+        with mock.patch.object(dc.os, "scandir", scandir):
+            result = self.scan()
+        ids = self.ids(result)
+        self.assertEqual(ids["project:my-app"], "B")
+        self.assertEqual(self.item(result, "project:my-app")["paths"], [str(self.h("my-app/node_modules"))])
+        for item_id in ids:
+            self.assertFalse(item_id.startswith(("project:Documents", "project:Desktop", "project:Downloads",
+                                                 "project:.hidden", "project:iCloud", "project:notes",
+                                                 "project:linked-app", "project:live-app")), item_id)
+        self.assertEqual(sum(1 for i in ids if i == "project:Developer/old-web"), 1)
+        for rel in ("Documents", "Desktop", ".hidden-app", "iCloud Drive"):  # never even listed
+            folder = os.path.normcase(str(self.h(rel)))
+            self.assertFalse(any(p == folder or p.startswith(folder + os.sep) for p in listed), rel)
+        self.assertIn("project:live-app", self.ids(self.scan("--include-active")))  # the activity rule is unchanged
+        self.scan()
+        code, out, err = self.cli("clean", "project:my-app", "--yes")
+        self.assertEqual(code, 0, out + err)
+        self.assertFalse(self.h("my-app/node_modules").exists())
+        self.assertTrue(self.h("my-app/package.json").exists())
+        code, out, _ = self.cli("config")
+        self.assertIn('"home_projects": true', out)
+        self.assertIn("~/my-app", out)
+        self.write_config(home_projects=False)
+        self.assertNotIn("project:my-app", self.ids(self.scan()))
+        self.assertIn("home_projects: off", self.cli("config")[1])
+        self.write_config(home_projects="yes")
+        self.assertIn("home_projects: expected true or false", self.cli("config")[1])
+
+    def test_home_projects_skip_project_roots(self):
+        self.mk(self.h("work/package.json"), b"{}")
+        self.mk(self.h("work/node_modules/x"))
+        self.age(self.h("work"), 60)
+        self.write_config(project_roots=["~/work"])
+        self.assertNotIn("project:work", self.ids(self.scan()))  # a root is never a project, home or not
+        cfg, _ = dc.load_config()
+        self.assertEqual(dc.Context(cfg).home_projects, [])
+        self.write_config(project_roots=["~"])
+        self.assertEqual(dc.Context(dc.load_config()[0]).home_projects, [])
+
+    def dd(self, folder, workspace=None, extra=()):
+        self.mk(Path(folder) / "Build" / "Products" / "Debug-iphonesimulator" / "App.app" / "App")
+        for name in extra:
+            (Path(folder) / name).mkdir(parents=True, exist_ok=True)
+        with open(str(Path(folder) / "info.plist"), "wb") as handle:
+            plistlib.dump({"WorkspacePath": workspace} if workspace else {"LastAccessedDate": "x"}, handle)
+
+    def test_custom_derived_data_folders(self):
+        project = self.h("Developer/my-app")
+        self.mk(project / "App.xcodeproj" / "project.pbxproj")
+        dd = project / ".claude" / "worktrees" / "_dd"
+        self.dd(dd / "App", str(project / "App.xcodeproj"))
+        self.mk(dd / "screenshots" / "home.png")
+        self.dd(project / ".claude" / "worktrees" / "_dd" / "a" / "b" / "too-deep", str(project / "App.xcodeproj"))
+        self.dd(self.h("Developer/old-tool/dd"), extra=["Index.noindex"])  # no WorkspacePath, Index.noindex
+        self.dd(self.h("Developer/gone/dd"), str(self.tmp / "nowhere" / "Gone.xcodeproj"))
+        self.mk(self.h("Developer/src-app/MyApp/Info.plist"))        # an app's sources: not DerivedData
+        self.mk(self.h("Developer/src-app/MyApp/Build/notes.txt"))
+        self.mk(self.h("Developer/plain/info.plist"))                 # info.plist + Build/ but no extra signal
+        self.mk(self.h("Developer/plain/Build/x"))
+        self.mk(self.h("solo-app/package.json"), b"{}")                # a home project
+        self.dd(self.h("solo-app/.claude/dd/App"), str(self.h("solo-app")))
+        self.age(self.h("Developer/old-tool"), 60)
+        result = self.scan()
+        ids = {k: v for k, v in self.ids(result).items() if k.startswith("derived-data:")}
+        self.assertEqual(ids, {"derived-data:Developer/my-app/.claude/worktrees/_dd/App": "B",
+                               "derived-data:Developer/old-tool/dd": "A",
+                               "derived-data:Developer/gone/dd": "A",
+                               "derived-data:solo-app/.claude/dd/App": "B"})
+        item = self.item(result, "derived-data:Developer/my-app/.claude/worktrees/_dd/App")
+        self.assertEqual(item["paths"], [str(dd / "App")])
+        self.assertIn("my-app/App.xcodeproj", item["note"])
+        self.assertFalse(any(i.startswith("worktree:") for i in self.ids(result)))
+        code, out, _ = self.cli("clean", "derived-data:Developer/my-app/.claude/worktrees/_dd/App", "--yes",
+                                env={"DISK_CLEANUP_PROCS": "xcodebuild"})
+        self.assertIn("in use: xcodebuild is running", out)
+        self.assertTrue((dd / "App").exists())
+        code, out, err = self.cli("clean", "derived-data:Developer/my-app/.claude/worktrees/_dd/App", "--yes")
+        self.assertEqual(code, 0, out + err)
+        self.assertFalse((dd / "App").exists())
+        self.assertTrue((dd / "screenshots" / "home.png").exists())  # its sibling stays
+        self.assertTrue((project / "App.xcodeproj" / "project.pbxproj").exists())
+
+    def test_custom_derived_data_in_git_needs_no_tracked_files(self):
+        self.setup_git()
+        project = self.h("Developer/my-app")
+        self.mk(project / "README.md")
+        self.dd(project / "dd" / "tracked", str(project))
+        self.dd(project / ".claude" / "worktrees" / "_dd" / "App", str(project))
+        self.mk(project / ".gitignore", b".claude/\n")
+        self.git("init", "-q", cwd=project)
+        self.git("add", "README.md", ".gitignore", "dd", cwd=project)
+        self.git("commit", "-qm", "init", cwd=project)
+        ids = self.ids(self.scan())
+        self.assertIn("derived-data:Developer/my-app/.claude/worktrees/_dd/App", ids)
+        self.assertNotIn("derived-data:Developer/my-app/dd/tracked", ids)
+        self.assertFalse(any(i.startswith("worktree:") for i in ids))  # _dd holds no .git file: not a worktree
+
+    def dd_ids(self, result):
+        return {k: v for k, v in self.ids(result).items() if k.startswith("derived-data:")}
+
+    def test_derived_data_rule_rejects_folders_holding_anything_else(self):
+        project = self.h("Developer/my-app")                       # xcodebuild -derivedDataPath . in a project
+        self.mk(project / "App.xcodeproj" / "project.pbxproj")
+        self.mk(project / "Sources" / "main.swift", b"print(1)")
+        self.dd(project, str(project / "App.xcodeproj"), extra=["ModuleCache.noindex", "Index.noindex"])
+        other = self.h("Developer/other-app")                      # only a stray file next to the build data
+        self.dd(other, extra=["ModuleCache.noindex"])
+        self.mk(other / "notes.txt")
+        dd = self.h("Developer/third-app/.claude/worktrees/_dd")   # _dd itself is the DerivedData folder
+        self.mk(self.h("Developer/third-app/App.xcodeproj/project.pbxproj"))
+        self.dd(dd, str(self.h("Developer/third-app/App.xcodeproj")))
+        self.mk(dd / "p1-screens" / "a.png")
+        self.age(project, 60)
+        self.assertEqual(self.dd_ids(self.scan()), {})
+        self.assertTrue((project / "Sources" / "main.swift").exists())
+
+    def test_derived_data_rule_in_git_repo_and_worktree_roots(self):
+        self.setup_git()
+        project = self.h("Developer/my-app")
+        self.mk(project / "App.xcodeproj" / "project.pbxproj")
+        self.mk(project / "Sources" / "main.swift", b"print(1)")
+        self.mk(project / ".gitignore", b".claude/\nBuild/\n*.noindex\ninfo.plist\n")
+        self.git("init", "-q", cwd=project)
+        self.git("add", ".", cwd=project)
+        self.git("commit", "-qm", "init", cwd=project)
+        self.dd(project, str(project / "App.xcodeproj"), extra=["ModuleCache.noindex"])  # the committed repo itself
+        worktree = project / ".claude" / "worktrees" / "wt"
+        self.git("worktree", "add", "-q", str(worktree), cwd=project)
+        self.mk(worktree / "WIP.swift", b"uncommitted work")
+        self.dd(worktree, str(project / "App.xcodeproj"), extra=["ModuleCache.noindex"])
+        self.dd(project / ".claude" / "worktrees" / "_dd" / "App", str(project / "App.xcodeproj"))
+        self.age(project, 60)
+        self.assertEqual(self.dd_ids(self.scan()), {"derived-data:Developer/my-app/.claude/worktrees/_dd/App": "A"})
+
+    def test_derived_data_that_gained_files_after_the_scan_is_refused(self):
+        project = self.h("Developer/my-app")
+        self.mk(project / "App.xcodeproj" / "project.pbxproj")
+        dd = project / ".claude" / "worktrees" / "_dd" / "App"
+        self.dd(dd, str(project / "App.xcodeproj"))
+        item_id = "derived-data:Developer/my-app/.claude/worktrees/_dd/App"
+        result = self.scan()
+        self.assertIn(item_id, self.ids(result))
+        self.mk(dd / "screens" / "a.png")
+        code, out, _ = self.cli("clean", item_id, "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("skipped: no longer matches its rule", out)
+        self.assertTrue((dd / "screens" / "a.png").exists())
+        ctx = dc.Context(dc.load_config()[0])  # the check right before deleting, too
+        item = dict(self.item(result, item_id), root="home")
+        self.assertIn("no longer a DerivedData folder", dc.check_path(str(dd), item, ctx))
+        (dd / "screens" / "a.png").unlink()
+        (dd / "screens").rmdir()
+        self.assertIsNone(dc.check_path(str(dd), item, ctx))
+
+    def test_home_workspace_folders(self):
+        ws = self.h("my-ws")
+        self.mk(ws / "App" / "App.xcodeproj" / "project.pbxproj")
+        self.mk(ws / "App" / "Pods" / "x")
+        self.mk(ws / "App" / "Podfile")
+        self.mk(ws / "screenshots" / "a.png")
+        self.mk(ws / "social" / "engine" / "package.json", b"{}")  # two levels down: not looked for
+        self.mk(ws / "social" / "engine" / "node_modules" / "x")
+        self.mk(ws / ".hidden" / "package.json", b"{}")
+        self.mk(self.h("top-app/package.json"), b"{}")             # a marker at the top: no look one level down
+        self.mk(self.h("top-app/sub/package.json"), b"{}")
+        self.mk(self.h("Documents/ws/app/package.json"), b"{}")
+        cfg, _ = dc.load_config()
+        found = sorted(dc.rel_home(p) for p in dc.Context(cfg).home_projects)
+        self.assertEqual(found, ["my-ws/App", "top-app"])
+        self.assertIn("~/my-ws/App", self.cli("config")[1])
+        self.age(ws, 60)
+        result = self.scan()
+        ids = self.ids(result)
+        self.assertEqual(ids.get("project:my-ws/App"), "B")
+        self.assertEqual(self.item(result, "project:my-ws/App")["paths"], [str(ws / "App" / "Pods")])
+        self.assertFalse(any(i.startswith(("project:my-ws/social", "project:my-ws/.hidden", "project:Documents"))
+                             for i in ids), ids)
+        code, out, err = self.cli("clean", "project:my-ws/App", "--yes")
+        self.assertEqual(code, 0, out + err)
+        self.assertFalse((ws / "App" / "Pods").exists())
+        self.assertTrue((ws / "App" / "Podfile").exists())
+
+    DEV_SERVERS = ("npm run dev", "npm run web   ", "npm start", "npm test",
+                   "/Applications/Some.app/Contents/Helpers/disclaimer -- /usr/local/bin/npm --prefix admin run dev",
+                   "/Applications/Some.app/Contents/Helpers/disclaimer -- /usr/local/bin/npm run web",
+                   "node scripts/web.js",
+                   "/usr/local/bin/node /Users/u/my-app/node_modules/expo/bin/cli start --web --port 8081",
+                   "node /Users/u/my-app/admin/node_modules/.bin/vite",
+                   "/bin/zsh -lc npm run dev", "node /opt/homebrew/lib/node_modules/npm/bin/npm-cli.js run build")
+
+    def test_npm_dev_servers_do_not_use_the_cache(self):
+        names = dc.names_from_args(list(self.DEV_SERVERS))
+        self.assertIn("npm", names)  # still a running program name
+        self.assertFalse({"npm:cache", "npm:exec", "_npx"} & names, names)
+        activity = dc.Activity()
+        activity._names = names
+        for row in dc.CATALOG:
+            if row["id"] in ("npm-cache", "npx-cache"):
+                self.assertIsNone(activity.reason({"in_use": row["in_use"]}), row["id"])
+
+    def test_npm_cache_commands_and_npx(self):
+        for line in ("npm install", "npm ci", "npm i -D vite", "npm --prefix admin install", "npm cache clean --force",
+                     "npm", "npm --loglevel=warn update", "/bin/bash -c npm install",
+                     "node /opt/homebrew/lib/node_modules/npm/bin/npm-cli.js ci",
+                     "/usr/local/bin/npm install --global x"):
+            names = dc.names_from_args([line])
+            self.assertIn("npm:cache", names, line)
+            self.assertNotIn("npm:exec", names, line)
+        for line in ("corepack npm@10.2.0 install", "node /x/corepack/dist/corepack.js npm@10 ci", "npm init -y"):
+            self.assertEqual({"npm:cache"}, {n for n in dc.names_from_args([line]) if n.startswith("npm:")}, line)
+        for line in ("npm create vite@latest my-app", "npm init vite", "npm --prefix x init @scope/app"):
+            self.assertEqual({"npm:cache", "npm:exec"}, {n for n in dc.names_from_args([line]) if n.startswith("npm:")},
+                             line)
+        for line in ("npm exec @scope/server-x", "npx -y @scope/server-x", "npm x -- create-thing",
+                     "node /usr/local/lib/node_modules/npm/bin/npx-cli.js -y @scope/server-x"):
+            names = dc.names_from_args([line])
+            self.assertIn("npm:exec", names, line)
+            self.assertNotIn("npm:cache", names, line)
+        runs_from_npx = dc.names_from_args(["node /Users/u/.npm/_npx/0a1b2c/node_modules/.bin/server-x --stdio"])
+        self.assertIn("_npx", runs_from_npx)
+        self.assertFalse({"npm:cache", "npm:exec"} & runs_from_npx)
+        for line in ("/usr/bin/git commit -m npm install", "/usr/bin/say npx install", "/usr/bin/tail /Users/u/.npm/x"):
+            self.assertFalse({"npm:cache", "npm:exec"} & dc.names_from_args([line]), line)
+
+    def test_npx_keeps_only_its_own_folder(self):
+        self.fixture()
+        self.scan()
+        procs = "npm,node,npm:exec,_npx"  # a dev server and an MCP server started with npx
+        code, out, _ = self.cli("clean", "npm-cache", "npx-cache", env={"DISK_CLEANUP_PROCS": procs})
+        self.assertIn("remove: " + str(self.h(".npm/_cacache")), out)
+        self.assertIn("npx-cache: skip: in use: npx (npm exec) is running", out)
+        code, out, _ = self.cli("clean", "npm-cache", "npx-cache", "--yes", env={"DISK_CLEANUP_PROCS": "node,_npx"})
+        self.assertIn("npx-cache: skipped: in use: a program from the npx cache is running", out)
+        self.assertFalse(self.h(".npm/_cacache").exists())
+        self.assertTrue(self.h(".npm/_npx/abc/x").exists())
 
 
 class HookTest(Base):
